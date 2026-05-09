@@ -22,6 +22,18 @@ py alms_app.py
 python alms_app.py
 ```
 
+```pyinstaller
+옵션 의미:
+--onefile: exe 하나로 묶음
+--windowed: 콘솔창 없이 GUI만 실행
+--name ALMS: exe 이름을 ALMS.exe로 지정
+현재 앱은 실행 폴더에 alms_secure.dat, alms_secure.key를 생성하므로, ALMS.exe를 원하는 폴더에 두고 실행하면 그 폴더 기준으로 데이터 파일이 만들어집니다.
+아이콘까지 넣고 싶으면 .ico 파일을 준비한 뒤:
+
+py -m PyInstaller --onefile --windowed --name ALMS --icon alms.ico alms_app.py
+```
+
+
 ## 주요 기능
 
 - 사번, 비밀번호, 이름, 입사일자 기반 사용자 등록/로그인
