@@ -1,3 +1,16 @@
+# This file is part of ALMS (Advanced Annual Leave Management System).
+# Copyright (C) 2026-present ALMS contributors <https://github.com/go8022/AdvancedLeaveManagementSystem>
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 import base64
 import calendar
 import json
@@ -25,6 +38,7 @@ from tkinter import (
     Scrollbar,
     Spinbox,
     StringVar,
+    Toplevel,
     Tk,
     ttk,
 )
@@ -164,6 +178,8 @@ class AuthManager:
             "name": name,
             "hire_date": date_to_str(parsed_hire_date),
             "manual_entitlement_days": None,
+            "manual_entitlement_days_by_fy": {},
+            "window_geometry": None,
             "leave_records": {},
             "memos": {},
         }
@@ -230,33 +246,56 @@ class LeaveEngine:
             return float(max(0, min(11, months)))
         return float(min(25, 15 + max(0, (years - 1) // 2)))
 
-    def entitlement_days(self) -> float:
-        manual = self.user.get("manual_entitlement_days")
-        if manual is None:
-            return self.estimated_entitlement_days()
-        return float(manual)
+    def entitlement_days(self, today: Optional[date] = None) -> float:
+        fy = self.fiscal_year(today)
+        manual_by_fy = self.user.setdefault("manual_entitlement_days_by_fy", {})
+        manual = manual_by_fy.get(self.fiscal_year_key(fy))
+        if manual is not None:
+            return float(manual)
+
+        # Backward compatibility: old data had one manual entitlement value per user.
+        legacy_manual = self.user.get("manual_entitlement_days")
+        if legacy_manual is not None and fy == self.fiscal_year():
+            return float(legacy_manual)
+        return self.estimated_entitlement_days(fy.start)
+
+    def fiscal_year_key(self, fiscal_year: FiscalYear) -> str:
+        return f"{date_to_str(fiscal_year.start)}_{date_to_str(fiscal_year.end)}"
 
     def mode_hours(self, mode: str) -> float:
         return WORK_HOURS_PER_DAY if mode == "전일" else WORK_HOURS_PER_DAY / 2
 
-    def annual_leave_hours_used(self, status: Optional[str] = None) -> float:
+    def annual_leave_hours_used(
+        self,
+        status: Optional[str] = None,
+        fiscal_year: Optional[FiscalYear] = None,
+        date_until: Optional[date] = None,
+    ) -> float:
         total = 0.0
-        fy = self.fiscal_year()
+        fy = fiscal_year or self.fiscal_year()
         for day_key, records in self.user.get("leave_records", {}).items():
             day = parse_date(day_key)
             if not (fy.start <= day <= fy.end):
+                continue
+            if date_until is not None and day > date_until:
                 continue
             for record in records:
                 if record.get("type") == "연차휴가(유급)" and (status is None or record.get("status") == status):
                     total += self.mode_hours(record.get("mode", "전일"))
         return total
 
-    def remaining_hours(self) -> float:
-        return self.entitlement_days() * WORK_HOURS_PER_DAY - self.annual_leave_hours_used()
+    def remaining_hours(self, fiscal_year: Optional[FiscalYear] = None) -> float:
+        fy = fiscal_year or self.fiscal_year()
+        return self.entitlement_days(fy.start) * WORK_HOURS_PER_DAY - self.annual_leave_hours_used(fiscal_year=fy)
 
-    def usage_percent(self) -> float:
-        entitlement = self.entitlement_days() * WORK_HOURS_PER_DAY
-        return 0.0 if entitlement <= 0 else min(999.0, self.annual_leave_hours_used() / entitlement * 100)
+    def usage_percent(self, fiscal_year: Optional[FiscalYear] = None) -> float:
+        fy = fiscal_year or self.fiscal_year()
+        today = date.today()
+        if fy.start > today:
+            return 0.0
+        entitlement = self.entitlement_days(fy.start) * WORK_HOURS_PER_DAY
+        actual_used = self.annual_leave_hours_used(status="실시완료", fiscal_year=fy, date_until=today)
+        return 0.0 if entitlement <= 0 else min(999.0, actual_used / entitlement * 100)
 
     def is_holiday(self, day: date) -> bool:
         return day in self.kr_holidays
@@ -270,6 +309,20 @@ class LeaveEngine:
     def is_in_fiscal_year(self, day: date) -> bool:
         fy = self.fiscal_year()
         return fy.start <= day <= fy.end
+
+    def next_fiscal_year(self, today: Optional[date] = None) -> FiscalYear:
+        current = self.fiscal_year(today)
+        next_start = current.end + timedelta(days=1)
+        return FiscalYear(next_start, self._safe_anniversary(next_start.year + 1) - timedelta(days=1))
+
+    def planning_window(self, today: Optional[date] = None) -> FiscalYear:
+        current = self.fiscal_year(today)
+        next_fy = self.next_fiscal_year(today)
+        return FiscalYear(current.start, next_fy.end)
+
+    def is_plannable_date(self, day: date) -> bool:
+        window = self.planning_window()
+        return window.start <= day <= window.end
 
 
 class NotificationService:
@@ -340,7 +393,9 @@ class LoginWindow:
         username_entry.grid(row=1, column=1, pady=4)
         username_entry.bind("<FocusOut>", self.load_saved_profile)
         username_entry.bind("<Return>", self.load_saved_profile)
-        Entry(self.frame, textvariable=self.password, show="*", width=28).grid(row=2, column=1, pady=4)
+        password_entry = Entry(self.frame, textvariable=self.password, show="*", width=28)
+        password_entry.grid(row=2, column=1, pady=4)
+        password_entry.bind("<Return>", lambda _event: self.login())
         Entry(self.frame, textvariable=self.name, width=28).grid(row=3, column=1, pady=4)
         Entry(self.frame, textvariable=self.hire_date, width=28).grid(row=4, column=1, pady=4)
 
@@ -381,16 +436,19 @@ class CalendarUI:
         self.user = user
         self.engine = LeaveEngine(user)
         self.notifier = NotificationService(user)
+        self.active_fiscal_year = self.engine.fiscal_year()
         self.current_month = date.today().replace(day=1)
         self.selected_dates: set[date] = set()
         self.dragging = False
+        self.drag_start_day: Optional[date] = None
+        self.drag_selecting = True
         self.day_widgets: dict[date, Frame] = {}
 
         self.leave_type = StringVar(value=LEAVE_TYPES[0])
         self.leave_mode = StringVar(value=LEAVE_MODES[0])
         self.leave_status = StringVar(value=LEAVE_STATUS[0])
         self.memo_text = StringVar()
-        self.manual_days = StringVar(value=str(self.engine.entitlement_days()))
+        self.manual_days = StringVar(value=str(self.engine.entitlement_days(self.active_fiscal_year.start)))
 
         self._build()
         self.refresh_all()
@@ -398,7 +456,7 @@ class CalendarUI:
 
     def _build(self) -> None:
         self.root.title(APP_TITLE)
-        self.root.geometry("1180x820")
+        self.root.geometry(self.user.get("window_geometry") or "1180x820")
         self.root.minsize(980, 720)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -407,7 +465,7 @@ class CalendarUI:
         self.summary = Label(self.top, anchor="w", justify=LEFT, bg="#f5f7fb", font=("Malgun Gothic", 10, "bold"))
         self.summary.pack(side=LEFT, fill="x", expand=True)
         Button(self.top, text="PDF 출력", command=self.export_pdf).pack(side=RIGHT, padx=4)
-        Button(self.top, text="저장", command=self.save).pack(side=RIGHT, padx=4)
+        Button(self.top, text="Help", command=self.show_help).pack(side=RIGHT, padx=4)
 
         body = Frame(self.root)
         body.pack(fill=BOTH, expand=True)
@@ -432,7 +490,7 @@ class CalendarUI:
         self.calendar_frame = Frame(left, bg="#d8dde8")
         self.calendar_frame.pack(fill=BOTH, expand=True, pady=(8, 8))
 
-        list_frame = LabelFrame(left, text="선택일 상세 / 회계연도 전체 계획·메모")
+        list_frame = LabelFrame(left, text="선택일 상세 / 현재·다음 회계연도 계획·메모")
         list_frame.pack(fill=BOTH, expand=False)
         self.detail_list = Listbox(list_frame, height=9)
         detail_scroll = Scrollbar(list_frame, orient="vertical", command=self.detail_list.yview)
@@ -446,8 +504,10 @@ class CalendarUI:
         entitlement = LabelFrame(parent, text="연차 보정")
         entitlement.pack(fill="x", pady=(0, 10))
         entitlement.grid_columnconfigure(1, weight=1)
-        Label(entitlement, text="최종 연차 일수").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        Spinbox(entitlement, from_=0, to=40, increment=0.5, textvariable=self.manual_days, width=8).grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        Label(entitlement, text="선택년도 연차").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        manual_days_input = Spinbox(entitlement, from_=0, to=40, increment=0.5, textvariable=self.manual_days, width=8)
+        manual_days_input.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        manual_days_input.bind("<Return>", lambda _event: self.apply_manual_days())
         Button(entitlement, text="반영", command=self.apply_manual_days).grid(row=0, column=2, padx=6, pady=6)
 
         form = LabelFrame(parent, text="휴가 입력")
@@ -463,9 +523,11 @@ class CalendarUI:
         Button(form, text="휴가입력/수정", command=self.add_or_update_leave).grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=4)
         Button(form, text="선택 종류/모드 삭제", command=self.delete_leave).grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=4)
 
-        memo = LabelFrame(parent, text="메모")
+        memo = LabelFrame(parent, text="메모 (10자이내, 하나의 메모가능)")
         memo.pack(fill="x", pady=(0, 10))
-        Entry(memo, textvariable=self.memo_text, width=32).pack(fill="x", padx=6, pady=6)
+        memo_input = Entry(memo, textvariable=self.memo_text, width=32)
+        memo_input.pack(fill="x", padx=6, pady=6)
+        memo_input.bind("<Return>", lambda _event: self.upsert_memo())
         Button(memo, text="메모 추가/수정", command=self.upsert_memo).pack(fill="x", padx=6, pady=3)
         Button(memo, text="선택일 메모삭제", command=self.delete_memo).pack(fill="x", padx=6, pady=3)
 
@@ -485,30 +547,46 @@ class CalendarUI:
 
     def go_today(self) -> None:
         self.current_month = date.today().replace(day=1)
+        self.active_fiscal_year = self.engine.fiscal_year()
         self.selected_dates = {date.today()}
         self.refresh_all()
 
     def refresh_all(self) -> None:
         self.engine = LeaveEngine(self.user)
+        self._sync_active_fiscal_year()
+        self._refresh_manual_days_field()
         self._draw_calendar()
         self._refresh_summary()
         self._refresh_details()
 
+    def _sync_active_fiscal_year(self) -> None:
+        planning_window = self.engine.planning_window()
+        if not (planning_window.start <= self.active_fiscal_year.start <= planning_window.end):
+            self.active_fiscal_year = self.engine.fiscal_year()
+
+    def _is_active_fiscal_date(self, day: date) -> bool:
+        return self.active_fiscal_year.start <= day <= self.active_fiscal_year.end
+
+    def _refresh_manual_days_field(self) -> None:
+        self.manual_days.set(str(self.engine.entitlement_days(self.active_fiscal_year.start)))
+
     def _refresh_summary(self) -> None:
-        fy = self.engine.fiscal_year()
-        entitlement = self.engine.entitlement_days()
-        used = self.engine.annual_leave_hours_used()
-        remain = self.engine.remaining_hours()
+        fy = self.active_fiscal_year
+        entitlement = self.engine.entitlement_days(fy.start)
+        used = self.engine.annual_leave_hours_used(fiscal_year=fy)
+        actual_used = self.engine.annual_leave_hours_used(status="실시완료", fiscal_year=fy, date_until=date.today())
+        remain = self.engine.remaining_hours(fy)
         today = date.today()
         self.summary.config(
             text=(
                 f"이름: {self.user['name']} | 사번: {self.user['username']} | 입사일: {self.user['hire_date']} | "
                 f"입사년차: {self.engine.years_of_service()}년 | 오늘: {date_to_str(today)}\n"
-                f"회계연도: {date_to_str(fy.start)} ~ {date_to_str(fy.end)} | "
+                f"선택 회계연도: {date_to_str(fy.start)} ~ {date_to_str(fy.end)} | "
                 f"총 연차: {entitlement:.1f}일/{entitlement * WORK_HOURS_PER_DAY:.0f}시간 | "
                 f"사용/계획: {used / WORK_HOURS_PER_DAY:.1f}일/{used:.0f}시간 | "
+                f"실시완료: {actual_used / WORK_HOURS_PER_DAY:.1f}일/{actual_used:.0f}시간 | "
                 f"잔여: {remain / WORK_HOURS_PER_DAY:.1f}일/{remain:.0f}시간 | "
-                f"권장 사용량 대비 사용률: {self.engine.usage_percent():.1f}%"
+                f"휴가사용률: {self.engine.usage_percent(fy):.1f}%"
             )
         )
 
@@ -518,14 +596,14 @@ class CalendarUI:
         self.day_widgets.clear()
         self.month_label.config(text=f"{self.current_month.year}년 {self.current_month.month}월")
 
-        weekdays = ["월", "화", "수", "목", "금", "토", "일"]
+        weekdays = ["일", "월", "화", "수", "목", "금", "토"]
         for col, name in enumerate(weekdays):
             Label(self.calendar_frame, text=name, bg="#39465e", fg="white", font=("Malgun Gothic", 10, "bold")).grid(
                 row=0, column=col, sticky="nsew", padx=1, pady=1
             )
             self.calendar_frame.columnconfigure(col, weight=1, uniform="cal")
 
-        month_days = calendar.Calendar(firstweekday=0).monthdatescalendar(self.current_month.year, self.current_month.month)
+        month_days = calendar.Calendar(firstweekday=6).monthdatescalendar(self.current_month.year, self.current_month.month)
         for row, week in enumerate(month_days, start=1):
             self.calendar_frame.rowconfigure(row, weight=1, uniform="cal")
             for col, day in enumerate(week):
@@ -536,12 +614,13 @@ class CalendarUI:
         records = self.user.get("leave_records", {}).get(date_to_str(day), [])
         memo = self.user.get("memos", {}).get(date_to_str(day), "")
         in_month = day.month == self.current_month.month
-        in_fy = self.engine.is_in_fiscal_year(day)
+        in_fy = self._is_active_fiscal_date(day)
         selected = day in self.selected_dates
         bg = self._day_bg(day, records, in_month, in_fy, selected)
         fg = "#111827" if in_month and in_fy else "#8a8f9c"
 
-        cell = Frame(parent, bg=bg, highlightthickness=2 if selected else 0, highlightbackground="#1f6feb")
+        border_color = "#1f6feb" if selected else bg
+        cell = Frame(parent, bg=bg, highlightthickness=2, highlightbackground=border_color, highlightcolor=border_color)
         day_label = Label(cell, text=str(day.day), anchor="nw", bg=bg, fg=fg, font=("Malgun Gothic", 10, "bold"))
         mark_label = Label(cell, text=self._day_mark(records, day), anchor="nw", justify=LEFT, bg=bg, fg="#18212f", font=("Malgun Gothic", 8))
         memo_label = Label(cell, text=memo[:10], anchor="sw", bg=bg, fg="#374151", font=("Malgun Gothic", 8))
@@ -564,11 +643,11 @@ class CalendarUI:
             return "#eceff4"
         if self.engine.is_holiday(day):
             return "#fff6bf"
-        if any(r.get("status") == "실시완료" and r.get("mode") == "전일" for r in records):
+        if any(r.get("status") == "실시완료" for r in records):
             return "#72b878"
         if any(r.get("status") == "계획" and r.get("mode") == "전일" for r in records):
             return "#c8f0c2"
-        if any("반차" in r.get("mode", "") for r in records):
+        if any(r.get("status") == "계획" and "반차" in r.get("mode", "") for r in records):
             return "#ead7ff"
         return "#ffffff"
 
@@ -603,31 +682,52 @@ class CalendarUI:
         return " ".join(parts[:3])
 
     def on_day_press(self, day: date) -> None:
-        if not self.engine.is_in_fiscal_year(day):
-            messagebox.showinfo("선택 불가", "현재 입사일 기준 회계연도 범위를 벗어난 날짜입니다.")
+        if not self.engine.is_plannable_date(day):
+            messagebox.showinfo("선택 불가", "현재 또는 다음 회계연도 범위를 벗어난 날짜는 선택할 수 없습니다.")
             return
+        day_fiscal_year = self.engine.fiscal_year(day)
+        if day_fiscal_year != self.active_fiscal_year:
+            self.active_fiscal_year = day_fiscal_year
+            self.selected_dates.clear()
+            self._refresh_manual_days_field()
+            self._draw_calendar()
+            self._refresh_summary()
         self.dragging = True
+        self.drag_start_day = day
         if day in self.selected_dates:
             self.selected_dates.remove(day)
+            self.drag_selecting = False
         else:
             self.selected_dates.add(day)
+            self.drag_selecting = True
         self._refresh_day_cell(day)
         self._refresh_details()
 
     def on_day_drag(self, event) -> None:
         widget = event.widget.winfo_containing(event.x_root, event.y_root)
-        while widget is not None:
-            for day, cell in self.day_widgets.items():
-                if widget == cell or widget.master == cell:
-                    if self.engine.is_in_fiscal_year(day) and day not in self.selected_dates:
-                        self.selected_dates.add(day)
-                        self._refresh_day_cell(day)
-                        self._refresh_details()
-                    return
-            widget = widget.master
+        day = self._day_from_widget(widget)
+        if day is None or day == self.drag_start_day or not self._is_active_fiscal_date(day):
+            return
+        if self.drag_selecting and day not in self.selected_dates:
+            self.selected_dates.add(day)
+            self._refresh_day_cell(day)
+            self._refresh_details()
+        elif not self.drag_selecting and day in self.selected_dates:
+            self.selected_dates.remove(day)
+            self._refresh_day_cell(day)
+            self._refresh_details()
 
     def on_day_release(self) -> None:
         self.dragging = False
+        self.drag_start_day = None
+
+    def _day_from_widget(self, widget) -> Optional[date]:
+        while widget is not None:
+            for day, cell in self.day_widgets.items():
+                if widget == cell:
+                    return day
+            widget = widget.master
+        return None
 
     def _refresh_day_cell(self, day: date) -> None:
         cell = self.day_widgets.get(day)
@@ -635,10 +735,11 @@ class CalendarUI:
             return
         records = self.user.get("leave_records", {}).get(date_to_str(day), [])
         in_month = day.month == self.current_month.month
-        in_fy = self.engine.is_in_fiscal_year(day)
+        in_fy = self._is_active_fiscal_date(day)
         selected = day in self.selected_dates
         bg = self._day_bg(day, records, in_month, in_fy, selected)
-        cell.configure(bg=bg, highlightthickness=2 if selected else 0)
+        border_color = "#1f6feb" if selected else bg
+        cell.configure(bg=bg, highlightthickness=2, highlightbackground=border_color, highlightcolor=border_color)
         self._set_child_backgrounds(cell, bg)
 
     def _set_child_backgrounds(self, widget, bg: str) -> None:
@@ -657,7 +758,7 @@ class CalendarUI:
                 self._insert_day_detail(day, indent="  ")
             self.detail_list.insert(END, "")
 
-        self.detail_list.insert(END, "회계연도 전체 계획·메모")
+        self.detail_list.insert(END, "현재·다음 회계연도 계획·메모")
         scheduled_days = self._scheduled_days_in_fiscal_year()
         if not scheduled_days:
             self.detail_list.insert(END, "  등록된 휴가나 메모가 없습니다.")
@@ -671,7 +772,7 @@ class CalendarUI:
             self.detail_list.see(first_current_month_index)
 
     def _scheduled_days_in_fiscal_year(self) -> list[date]:
-        fy = self.engine.fiscal_year()
+        fy = self.active_fiscal_year
         day_keys = set(self.user.get("leave_records", {}).keys()) | set(self.user.get("memos", {}).keys())
         days = []
         for day_key in day_keys:
@@ -705,7 +806,8 @@ class CalendarUI:
         if value < 0 or (value * 2) % 1 != 0:
             messagebox.showerror("입력 오류", "연차 일수는 0.5일 단위의 양수여야 합니다.")
             return
-        self.user["manual_entitlement_days"] = value
+        fiscal_key = self.engine.fiscal_year_key(self.active_fiscal_year)
+        self.user.setdefault("manual_entitlement_days_by_fy", {})[fiscal_key] = value
         self.save()
         self.refresh_all()
 
@@ -716,14 +818,36 @@ class CalendarUI:
         warnings = [date_to_str(d) for d in self.selected_dates if self.engine.is_weekend(d) or self.engine.is_holiday(d)]
         if warnings and not messagebox.askyesno("휴일 경고", "주말 또는 공휴일이 포함되어 있습니다.\n" + "\n".join(warnings) + "\n계속 입력할까요?"):
             return
+        conflict_days = self._leave_conflict_days(self.leave_mode.get())
+        if conflict_days:
+            messagebox.showerror(
+                "휴가 입력 충돌",
+                "전일 휴가와 반차 휴가는 같은 날짜에 함께 입력할 수 없습니다.\n"
+                "오전반차와 오후반차 조합만 가능합니다.\n\n"
+                + "\n".join(conflict_days),
+            )
+            return
         for day in sorted(self.selected_dates):
             day_key = date_to_str(day)
             records = self.user.setdefault("leave_records", {}).setdefault(day_key, [])
-            records[:] = [r for r in records if not (r.get("type") == self.leave_type.get() and r.get("mode") == self.leave_mode.get())]
+            records[:] = [r for r in records if r.get("mode") != self.leave_mode.get()]
             records.append({"type": self.leave_type.get(), "mode": self.leave_mode.get(), "status": self.leave_status.get()})
         self.selected_dates.clear()
         self.save()
         self.refresh_all()
+
+    def _leave_conflict_days(self, new_mode: str) -> list[str]:
+        conflict_days = []
+        for day in sorted(self.selected_dates):
+            records = self.user.get("leave_records", {}).get(date_to_str(day), [])
+            other_modes = [r.get("mode", "전일") for r in records if r.get("mode") != new_mode]
+            has_full_day = any(mode == "전일" for mode in other_modes)
+            has_half_day = any("반차" in mode for mode in other_modes)
+            if new_mode == "전일" and has_half_day:
+                conflict_days.append(f"- {date_to_str(day)}: 이미 반차가 있습니다.")
+            elif new_mode != "전일" and has_full_day:
+                conflict_days.append(f"- {date_to_str(day)}: 이미 전일 휴가가 있습니다.")
+        return conflict_days
 
     def delete_leave(self) -> None:
         for day in sorted(self.selected_dates):
@@ -732,7 +856,7 @@ class CalendarUI:
             records[:] = [
                 r
                 for r in records
-                if not (r.get("type") == self.leave_type.get() and r.get("mode") == self.leave_mode.get())
+                if r.get("mode") != self.leave_mode.get()
             ]
             if day_key in self.user.get("leave_records", {}) and not records:
                 del self.user["leave_records"][day_key]
@@ -751,6 +875,7 @@ class CalendarUI:
         for day in self.selected_dates:
             self.user.setdefault("memos", {})[date_to_str(day)] = text
         self.memo_text.set("")
+        self.selected_dates.clear()
         self.save()
         self.refresh_all()
 
@@ -767,10 +892,55 @@ class CalendarUI:
     def save(self) -> None:
         self.auth.update_user(self.user)
 
+    def show_help(self) -> None:
+        help_window = Toplevel(self.root)
+        help_window.title("ALMS Help")
+        help_window.geometry("560x720")
+        help_window.transient(self.root)
+        help_window.grab_set()
+
+        text = (
+            "ALMS 사용법 (2026-05-09)\n\n"
+            "01. 초기 사용시에는 정보-사번, 비밀번호, 이름, 입사일자- 입력 후\n"
+            "    신규등록을 하시고 사용하세요.\n"
+            "02. 비밀번호는 본인이 관리하셔야 하며, 분실 시 내용 재 구성해야 합니다.\n"
+            "03. 보안을 위하여 사번을 초기 입력 후 사용이 가능합니다.\n"
+            "04. 선택 회계년도에 따른 연차 갯수를 ""가이아"" 시스템의 정보를 확인하여 입력하세요.\n"
+            "05. 달력에서 날짜를 클릭하면 선택되고, 다시 클릭하면 선택 해제됩니다.\n"
+            "06. 여러 날짜는 마우스로 드래그해서 선택할 수 있습니다.\n"
+            "    해제하려면 선택-선택 초기화 선택.\n"
+            "07. 휴가종류, 신청모드, 상태를 고른 뒤 '휴가입력/수정'을 누르면 저장됩니다.\n"
+            "08. 삭제는 같은 휴가종류와 신청모드 기준으로 날짜 선택 후에 삭제 가능합니다.\n"
+            "09. 메모는 날짜당 하나만 저장되며 10자 이내입니다.\n"
+            "10. 현재 회계연도-입사일자 기준-와 다음 회계연도 날짜까지 계획 입력이 가능합니다.\n"
+            "11. 다음 회계연도 날짜를 클릭하면 선택 회계연도가 다음 회계연도로 전환됩니다.\n"
+            "12. 선택 회계연도 밖의 날짜는 회색으로 표시되며,\n"
+            "    현재와 내년회계년도 이외의 회계연도는 선택할 수 없습니다.\n"
+            "13. 하단 목록에는 선택 회계연도의 휴가와 메모가 날짜순으로 표시됩니다.\n"
+            "14. PDF 출력은 선택 회계연도 12+1 개월 달력과 보고 내용을\n"
+            "    Documents 폴더에 저장합니다.\n"
+            "15. 선택년도 연차 값은 회계 연도별로 따로 저장됩니다.\n"
+            "16. 입력/수정/삭제 내용은 즉시 암호화 .dat 파일에 저장됩니다.\n"
+            "    폴더 이동시 .dat 와 .key 파일을 모두 옮겨야 합니다.\n\n"
+            "표시 기호\n"
+            "---------------------\n"
+            "L: 전일 휴가\n"
+            "H-am: 오전 반차\n"
+            "H-pm: 오후 반차\n"
+            "M: PDF에서 메모 있음\n"
+            "Hol: PDF에서 공휴일\n\n\n"
+            "Copyleft 🄯 2026 Phil Jeong.\n"
+            "Permission is granted to copy, distribute and/or modify this document under\n"
+            "the terms of the GNU Free Documentation License, Version 1.3 or any later\n"
+            "version published by the Free Software Foundation.\n"
+        )
+        Label(help_window, text=text, justify=LEFT, anchor="nw", padx=16, pady=16, font=("Malgun Gothic", 10)).pack(fill=BOTH, expand=True)
+        Button(help_window, text="닫기", command=help_window.destroy).pack(pady=(0, 12))
+
     def export_pdf(self) -> None:
         try:
             from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.pagesizes import A4, portrait
             from reportlab.lib.styles import getSampleStyleSheet
             from reportlab.pdfbase import pdfmetrics
             from reportlab.pdfbase.ttfonts import TTFont
@@ -781,15 +951,19 @@ class CalendarUI:
 
         docs = Path.home() / "Documents"
         docs.mkdir(exist_ok=True)
-        fy = self.engine.fiscal_year()
+        fy = self.active_fiscal_year
         output = docs / f"ALMS_{self.user['username']}_{fy.start.year}_{fy.end.year}.pdf"
-        doc = SimpleDocTemplate(str(output), pagesize=landscape(A4), rightMargin=18, leftMargin=18, topMargin=18, bottomMargin=18)
+        doc = SimpleDocTemplate(str(output), pagesize=portrait(A4), rightMargin=16, leftMargin=16, topMargin=16, bottomMargin=16)
         styles = getSampleStyleSheet()
         pdf_font = self._register_pdf_font(pdfmetrics, TTFont)
         styles["Title"].fontName = pdf_font
+        styles["Title"].fontSize = 13
+        styles["Title"].leading = 15
         story = [
-            Paragraph(f"ALMS Annual Calendar - {self.user['name']} ({date_to_str(fy.start)} ~ {date_to_str(fy.end)})", styles["Title"]),
-            Spacer(1, 8),
+            Paragraph("연차종합정리 보고서", styles["Title"]),
+            Spacer(1, 4),
+            self._pdf_summary_table(Table, TableStyle, colors, pdf_font, fy),
+            Spacer(1, 5),
         ]
 
         months = []
@@ -801,16 +975,68 @@ class CalendarUI:
             cursor = date(year, (month - 1) % 12 + 1, 1)
 
         grid_rows = []
-        for chunk_start in range(0, len(months), 4):
+        columns = 3
+        month_col_width = 180
+        month_row_height = 128 if len(months) <= 12 else 108
+        for chunk_start in range(0, len(months), columns):
             row = []
-            for month_date in months[chunk_start : chunk_start + 4]:
-                row.append(self._month_pdf_table(month_date, Table, TableStyle, colors, pdf_font))
+            for month_date in months[chunk_start : chunk_start + columns]:
+                row.append(self._month_pdf_table(month_date, Table, TableStyle, colors, pdf_font, month_col_width))
+            while len(row) < columns:
+                row.append("")
             grid_rows.append(row)
-        table = Table(grid_rows, colWidths=[200] * 4, rowHeights=[168] * len(grid_rows))
-        table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4)]))
+        table = Table(grid_rows, colWidths=[month_col_width] * columns, rowHeights=[month_row_height] * len(grid_rows))
+        table.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("TOPPADDING", (0, 0), (-1, -1), 1),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ]
+            )
+        )
         story.append(table)
         doc.build(story)
         messagebox.showinfo("PDF 저장 완료", f"Documents 폴더에 저장했습니다.\n{output}")
+
+    def _pdf_summary_table(self, Table, TableStyle, colors, pdf_font: str, fy: FiscalYear):
+        entitlement = self.engine.entitlement_days(fy.start)
+        planned_hours = self.engine.annual_leave_hours_used(status="계획", fiscal_year=fy)
+        completed_hours = self.engine.annual_leave_hours_used(status="실시완료", fiscal_year=fy, date_until=date.today())
+        total_hours = self.engine.annual_leave_hours_used(fiscal_year=fy)
+        remaining_hours = self.engine.remaining_hours(fy)
+        usage_percent = self.engine.usage_percent(fy)
+        planned_days = planned_hours / WORK_HOURS_PER_DAY
+        completed_days = completed_hours / WORK_HOURS_PER_DAY
+        total_days = total_hours / WORK_HOURS_PER_DAY
+        remaining_days = remaining_hours / WORK_HOURS_PER_DAY
+
+        data = [
+            ["회계연도", f"{date_to_str(fy.start)} ~ {date_to_str(fy.end)}", "작성일", date_to_str(date.today())],
+            ["이름", self.user["name"], "사번", self.user["username"]],
+            ["총 연차", f"{entitlement:.1f}일 / {entitlement * WORK_HOURS_PER_DAY:.0f}시간", "계획연차수/총연차수", f"{planned_days:.1f} / {entitlement:.1f}일"],
+            ["실시완료", f"{completed_days:.1f}일 / {completed_hours:.0f}시간", "계획+완료", f"{total_days:.1f}일 / {total_hours:.0f}시간"],
+            ["잔여", f"{remaining_days:.1f}일 / {remaining_hours:.0f}시간", "사용률", f"{usage_percent:.1f}%"],
+        ]
+        table = Table(data, colWidths=[66, 194, 88, 190], rowHeights=[15] * len(data))
+        table.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (-1, -1), pdf_font),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("LEADING", (0, 0), (-1, -1), 8),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e8eef8")),
+                    ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#e8eef8")),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#9aa5b5")),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ]
+            )
+        )
+        return table
 
     def _register_pdf_font(self, pdfmetrics, TTFont) -> str:
         font_candidates = [
@@ -826,16 +1052,17 @@ class CalendarUI:
                     continue
         return "Helvetica"
 
-    def _month_pdf_table(self, month_date: date, Table, TableStyle, colors, pdf_font: str):
-        data = [[f"{month_date.year}-{month_date.month:02d}", "", "", "", "", "", ""], ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]]
+    def _month_pdf_table(self, month_date: date, Table, TableStyle, colors, pdf_font: str, table_width: int = 180):
+        cell_width = table_width / 7
+        data = [[f"{month_date.year}-{month_date.month:02d}", "", "", "", "", "", ""], ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]]
         style_cmds = [
             ("SPAN", (0, 0), (-1, 0)),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("FONTNAME", (0, 0), (-1, -1), pdf_font),
-            ("FONTSIZE", (0, 0), (-1, 0), 7),
-            ("FONTSIZE", (0, 1), (-1, -1), 5),
-            ("LEADING", (0, 1), (-1, -1), 6),
+            ("FONTSIZE", (0, 0), (-1, 0), 6),
+            ("FONTSIZE", (0, 1), (-1, -1), 4.4),
+            ("LEADING", (0, 1), (-1, -1), 5),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#39465e")),
             ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#dbe5f5")),
@@ -845,7 +1072,7 @@ class CalendarUI:
             ("TOPPADDING", (0, 0), (-1, -1), 1),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
         ]
-        for week in calendar.Calendar(firstweekday=0).monthdatescalendar(month_date.year, month_date.month):
+        for week in calendar.Calendar(firstweekday=6).monthdatescalendar(month_date.year, month_date.month):
             cells = []
             for day in week:
                 row_index = len(data)
@@ -858,17 +1085,21 @@ class CalendarUI:
                 mark = self._short_day_mark(records, day, include_memo=True)
                 cells.append(f"{day.day}\n{mark}" if mark else str(day.day))
                 style_cmds.append(("BACKGROUND", (col_index, row_index), (col_index, row_index), self._pdf_day_color(day, records, colors)))
+                if not self._is_active_fiscal_date(day):
+                    style_cmds.append(("TEXTCOLOR", (col_index, row_index), (col_index, row_index), colors.HexColor("#9aa3af")))
             data.append(cells)
-        table = Table(data, colWidths=[28] * 7, rowHeights=[13, 11] + [22] * (len(data) - 2))
+        table = Table(data, colWidths=[cell_width] * 7, rowHeights=[10, 8] + [14] * (len(data) - 2))
         table.setStyle(TableStyle(style_cmds))
         return table
 
     def _pdf_day_color(self, day: date, records: list[dict], colors):
-        if any(r.get("status") == "실시완료" and r.get("mode") == "전일" for r in records):
+        if not self._is_active_fiscal_date(day):
+            return colors.HexColor("#eef1f6")
+        if any(r.get("status") == "실시완료" for r in records):
             return colors.HexColor("#6fb879")
         if any(r.get("status") == "계획" and r.get("mode") == "전일" for r in records):
             return colors.HexColor("#c8f0c2")
-        if any("반차" in r.get("mode", "") for r in records):
+        if any(r.get("status") == "계획" and "반차" in r.get("mode", "") for r in records):
             return colors.HexColor("#ead7ff")
         if self.user.get("memos", {}).get(date_to_str(day)):
             return colors.HexColor("#dbeafe")
@@ -880,6 +1111,7 @@ class CalendarUI:
 
     def close(self) -> None:
         self.notifier.stop()
+        self.user["window_geometry"] = self.root.geometry()
         self.save()
         self.root.destroy()
 
